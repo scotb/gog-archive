@@ -20,9 +20,9 @@ $mode = if ($ListAll) { 'ListAll' } elseif ($DownloadAll) { 'DownloadAll' } else
 $downloadDir = '/downloads'
 $threads = '8'
 
-$startTime = Get-Date
+$startTime    = Get-Date
+$startTimeFmt = $startTime.ToString("MM/dd/yyyy HH:mm:ss")
 
-$i = 0
 $dockerArgs = @('run', '--rm')
 if ($Tty) { $dockerArgs += '-t' }
 $dockerArgs += 'gogrepo'
@@ -57,83 +57,94 @@ $lgogArgs += '--threads'; $lgogArgs += $threads
 
 $fullArgs = $dockerArgs + $lgogArgs
 
-$infoLines = @(
-    "==== GOG Sync Run Start: $(Get-Date) ===="
-    "Mode: $mode"
-    "Download Directory: $downloadDir"
-    "Threads: $threads"
-    "TTY: $Tty"
-    "ShowAllOutput: $ShowAllOutput"
-    "VerboseLog: $VerboseLog"
-)
-$infoLines | Tee-Object -FilePath $logFile -Append
-# Print and log the command to both console and log file
-$cmdString = "Running command: docker-compose $($fullArgs -join ' ')"
-Write-Host $cmdString
-Add-Content -Path $logFile -Value $cmdString
+# Append a timestamped line to the log file
+function Write-Log($line) {
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -Path $logFile -Value "[$ts] $line"
+}
+
+# Run header — only emit lines for active/non-default values
+$headerLines = @("==== GOG Sync Run Start: $startTimeFmt ====", "Mode: $mode")
+if ($GameName)      { $headerLines += "Game: $GameName$(if ($ExactMatch) { ' (exact)' })" }
+if ($ShowAllOutput) { $headerLines += "ShowAllOutput: true" }
+if ($VerboseLog)    { $headerLines += "VerboseLog: true" }
+if ($Tty)           { $headerLines += "TTY: true" }
+foreach ($line in $headerLines) {
+    Write-Host $line
+    Write-Log $line
+}
+Write-Log "Running command: docker-compose $($fullArgs -join ' ')"
+
+$completeCount = 0
+$errorCount    = 0
+$warnCount     = 0
+$lastTotalTime = [DateTime]::MinValue
 
 if ($ListAll -or ($lgogArgs -contains '--list')) {
-    # Always show all output when listing, and suppress PowerShell error wrapping
+    # List mode: show everything on console and log
     cmd /c "docker-compose $($fullArgs -join ' ')" |
         ForEach-Object {
-            $line = $_
-            if ($line -match 'Repairing file') {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-            } else {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-            }
+            $line = $_ -replace '\x1B\[[0-9;?]*[A-Za-z]', ''
+            if ($line -match 'Getting product data|Getting game names|Getting game info') { return }
+            if ($line.Trim().Length -eq 0) { return }
+            Write-Host $line
+            Write-Log $line
         }
 } elseif ($ShowAllOutput) {
+    # Console: show all output after basic noise filtering
+    # Log: same but TUI progress blocks (thread status + progress bars + Total lines) are excluded
     cmd /c "docker-compose $($fullArgs -join ' ')" |
         ForEach-Object {
-            $line = $_
-            if ($line -match 'Repairing file') {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-            } else {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-            }
+            $line = $_ -replace '\x1B\[[0-9;?]*[A-Za-z]', ''
+            if ($line -match 'Getting product data|Getting game names|Getting game info') { return }
+            if ($line.Trim().Length -eq 0) { return }
+            Write-Host $line
+            $isTuiLine = ($line -match '^#[0-9]+\s') -or ($line -match '^\s*[0-9]+%\s') -or ($line -match '^Total:')
+            if (-not $isTuiLine) { Write-Log $line }
+            if ($line -match 'Download complete:|Repairing file:') { $completeCount++ }
+            elseif ($line -imatch '\berror\b') { $errorCount++ }
+            elseif ($line -imatch '\bwarning\b') { $warnCount++ }
         }
-} elseif ($VerboseLog) {
-    # Exclude all lines starting with #, only keep the last Total:/Remaining: line, errors, warnings, and run summary lines
-    $progressCount = 0
-    cmd /c "docker-compose $($fullArgs -join ' ')" |
-        ForEach-Object {
-            $line = $_
-            $line = $line -replace "[^\x09\x0A\x0D\x20-\x7E]", ''
-            if ($line -match 'Repairing file') {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-            } elseif ($line -match '(ERROR|WARNING|Run completed|====)' -and $line.Trim().Length -gt 0) {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-            } elseif ($line -match '^#') {
-                # For UI feedback, print a dot for each per-file line (not logged)
-                $progressCount++
-                if ($progressCount % 1000 -eq 0) { Write-Host -NoNewline "." }
-            }
-        }
-    if ($progressCount -gt 0) { Write-Host "" }
 } else {
+    # Default mode (--verbose-log also uses this path):
+    # Console: file completions, throttled Total heartbeat (~30s), errors, warnings
+    # Log: all output except TUI progress blocks, with timestamps
     cmd /c "docker-compose $($fullArgs -join ' ')" |
         ForEach-Object {
-            $line = $_
-            if ($line -match 'Repairing file') {
-                Write-Host $line
+            $line = $_ -replace '\x1B\[[0-9;?]*[A-Za-z]', ''
+            $line = $line -replace '\r', ''
+            if ($line -match 'Getting product data|Getting game names|Getting game info') { return }
+            if ($line.Trim().Length -eq 0) { return }
+            $ts = "[$(Get-Date -Format 'HH:mm:ss')]"
+            # Console and log: only meaningful events
+            if ($line -match 'Download complete:|Repairing file:') {
+                Write-Host "$ts $line"
                 Add-Content -Path $logFile -Value $line
-            } elseif ($line -match 'ERROR|WARNING') {
-                Write-Host $line
-                Add-Content -Path $logFile -Value $line
-                $i++
-                if ($i % 1000 -eq 0) { Write-Host -NoNewline "." }
+                $completeCount++
+            } elseif ($line -match '^Total:') {
+                $now = Get-Date
+                if (($now - $lastTotalTime).TotalSeconds -ge 30) {
+                    Write-Host "$ts $line"
+                    $lastTotalTime = $now
+                }
+            } elseif ($line -imatch '\berror\b') {
+                Write-Host "$ts [ERROR] $line"
+                Write-Log "[ERROR] $line"
+                $errorCount++
+            } elseif ($line -imatch '\bwarning\b') {
+                Write-Host "$ts [WARN] $line"
+                Write-Log "[WARN] $line"
+                $warnCount++
             }
         }
 }
 
-$endTime = Get-Date
-$elapsed = $endTime - $startTime
-$elapsedStr = $elapsed.ToString()
-"==== GOG Sync Run End: $endTime (Elapsed: " + $elapsedStr + ") ====" | Tee-Object -FilePath $logFile -Append
+$endTime    = Get-Date
+$elapsed    = $endTime - $startTime
+$elapsedStr = $elapsed.ToString('hh\:mm\:ss\.fff')
+$endTimeFmt = $endTime.ToString("MM/dd/yyyy HH:mm:ss")
+
+$summaryLine = "==== Summary: $completeCount file(s) completed, $errorCount error(s), $warnCount warning(s) ===="
+$endLine     = "==== GOG Sync Run End: $endTimeFmt (Elapsed: $elapsedStr) ===="
+Write-Host $summaryLine; Write-Log $summaryLine
+Write-Host $endLine;     Write-Log $endLine

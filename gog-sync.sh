@@ -2,33 +2,16 @@
 # Usage: ./gog-sync.sh [--download] [--download-all] [--repair] [--tty] [--show-all-output] [--game-name <name>] [--exact-match]
 
 
+
 log_file="gog-sync.log"
 cd ~/gog-archive
 
-start_time=$(date +%s)
-# Determine mode for logging
-if [ "$LIST_ALL" = true ]; then
-    MODE="ListAll"
-elif [ "$DOWNLOAD_ALL" = true ]; then
-    MODE="DownloadAll"
-elif [ -n "$DOWNLOAD_FLAG" ]; then
-    MODE="Download"
-elif [ -n "$REPAIR_FLAG" ]; then
-    MODE="Repair"
-else
-    MODE="ListUpdated"
-fi
+# High-precision start time (nanoseconds)
+start_time_ns=$(date +%s%N)
+start_time_fmt=$(date +"%m/%d/%Y %H:%M:%S")
+
 DOWNLOAD_DIR="/downloads"
 THREADS="8"
-
-echo "==== GOG Sync Run Start: $(date) ====" | tee -a "$log_file"
-echo "Mode: $MODE" | tee -a "$log_file"
-echo "Download Directory: $DOWNLOAD_DIR" | tee -a "$log_file"
-echo "Threads: $THREADS" | tee -a "$log_file"
-echo "TTY: $TTY_FLAG" | tee -a "$log_file"
-echo "ShowAllOutput: $SHOW_ALL_OUTPUT" | tee -a "$log_file"
-echo "VerboseLog: $VERBOSE_LOG" | tee -a "$log_file"
-
 
 DOWNLOAD_FLAG=""
 DOWNLOAD_ALL=false
@@ -73,6 +56,32 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# Determine mode for logging (after parsing)
+if [ "$LIST_ALL" = true ]; then
+    MODE="ListAll"
+elif [ "$DOWNLOAD_ALL" = true ]; then
+    MODE="DownloadAll"
+elif [ -n "$DOWNLOAD_FLAG" ]; then
+    MODE="Download"
+elif [ -n "$REPAIR_FLAG" ]; then
+    MODE="Repair"
+else
+    MODE="ListUpdated"
+fi
+
+# Append a timestamped line to the log file
+log_line() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$log_file"; }
+
+# Run header — only emit lines for active/non-default values
+header_lines=("==== GOG Sync Run Start: $start_time_fmt ====" "Mode: $MODE")
+[ -n "$GAME_NAME" ] && header_lines+=("Game: ${GAME_NAME}$([ "$EXACT_MATCH" = true ] && echo ' (exact)')")
+[ "$SHOW_ALL_OUTPUT" = true ] && header_lines+=("ShowAllOutput: true")
+[ "$VERBOSE_LOG" = true ]     && header_lines+=("VerboseLog: true")
+[ -n "$TTY_FLAG" ]            && header_lines+=("TTY: true")
+for line in "${header_lines[@]}"; do
+    echo "$line"
+    log_line "$line"
+done
 
 # Build lgogdownloader command
 GAME_ARG=""
@@ -95,49 +104,97 @@ else
     LGOG_COMMAND="lgogdownloader --list --updated $GAME_ARG --directory /downloads --threads 8"
 fi
 
-echo "Running command: docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND"
-echo "Running command: docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND" >> "$log_file"
+log_line "Running command: docker-compose run --rm ${TTY_FLAG} gogrepo ${LGOG_COMMAND}"
+
+# Temp files survive the pipeline subshell — used for counters and throttle state
+counter_file=$(mktemp)
+last_total_file=$(mktemp)
+echo "0 0 0" > "$counter_file"
+echo "0" > "$last_total_file"
 
 if [[ "$LGOG_COMMAND" == *"--list"* ]]; then
-
-# Always process output to log 'Repairing file' lines
-process_and_log() {
-    while IFS= read -r line; do
-        if [[ "$line" == *"Repairing file"* ]]; then
-            echo "$line" | tee -a "$log_file"
-        else
-            echo "$line" | tee -a "$log_file"
-        fi
-    done | awk '!a[$0]++'
-}
-
-if [[ "$LGOG_COMMAND" == *"--list"* ]]; then
-    docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND 2>&1 | process_and_log
-elif [ "$SHOW_ALL_OUTPUT" = true ]; then
-    docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND 2>&1 | process_and_log
-elif [ "$VERBOSE_LOG" = true ]; then
-    last_summary=""
+    # List mode: show everything on console and log (no TUI progress blocks in list output)
     docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND 2>&1 \
-        | sed -r 's/[^\x09\x0A\x0D\x20-\x7E]//g' \
-        | awk '!a[$0]++' \
+        | sed -r 's/\x1B\[[0-9;?]*[A-Za-z]//g' \
+        | grep -v -E 'Getting product data|Getting game names|Getting game info|^\s*$' \
         | while IFS= read -r line; do
-            if [[ "$line" == *"Repairing file"* ]]; then
-                echo "$line" | tee -a "$log_file"
-            elif [[ "$line" =~ ^(Total:|Remaining:) ]]; then
-                last_summary="$line"
-            elif [[ "$line" =~ (ERROR|WARNING|Run completed|====) ]] && [[ -n "${line// }" ]]; then
-                echo "$line" | tee -a "$log_file"
+            echo "$line"
+            log_line "$line"
+        done
+elif [ "$SHOW_ALL_OUTPUT" = true ]; then
+    # Console: show all output after basic noise filtering
+    # Log: same but TUI progress blocks (thread status + progress bars + Total lines) are excluded
+    docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND 2>&1 \
+        | sed -r 's/\x1B\[[0-9;?]*[A-Za-z]//g' \
+        | grep -v -E 'Getting product data|Getting game names|Getting game info|^\s*$' \
+        | while IFS= read -r line; do
+            echo "$line"
+            if ! [[ "$line" =~ ^#[0-9]+[[:space:]] ]] && \
+               ! [[ "$line" =~ ^[[:space:]]*[0-9]+%[[:space:]] ]] && \
+               ! [[ "$line" =~ ^Total: ]]; then
+                log_line "$line"
+            fi
+            read -r cc ec wc < "$counter_file"
+            if [[ "$line" == *"Download complete:"* ]] || [[ "$line" == *"Repairing file:"* ]]; then
+                cc=$((cc+1)); echo "$cc $ec $wc" > "$counter_file"
+            elif [[ "${line,,}" == *"error"* ]]; then
+                ec=$((ec+1)); echo "$cc $ec $wc" > "$counter_file"
+            elif [[ "${line,,}" == *"warning"* ]]; then
+                wc=$((wc+1)); echo "$cc $ec $wc" > "$counter_file"
             fi
         done
-    if [ -n "$last_summary" ]; then
-        echo "$last_summary" | tee -a "$log_file"
-    fi
 else
+    # Default mode (--verbose-log also uses this path):
+    # Console: file completions, throttled Total heartbeat (~30s), errors, warnings
+    # Log: errors, warnings, and file completion events only
     docker-compose run --rm $TTY_FLAG gogrepo $LGOG_COMMAND 2>&1 \
-        | awk '!a[$0]++ {if (index($0, "Repairing file")) {print $0; fflush();} else if (tolower($0) ~ /warning|error/) {print $0 > "/dev/stderr"; print $0; fflush();}}' \
-        | tee -a "$log_file" | awk 'NR % 1000 == 0 { printf "."; fflush() }'
+        | sed -r 's/\x1B\[[0-9;?]*[A-Za-z]//g' \
+        | tr -d '\r' \
+        | grep -v -E 'Getting product data|Getting game names|Getting game info|^\s*$' \
+        | while IFS= read -r line; do
+            ts="[$(date '+%H:%M:%S')]"
+            # Console and log: only meaningful events
+            read -r cc ec wc < "$counter_file"
+            if [[ "$line" == *"Download complete:"* ]] || [[ "$line" == *"Repairing file:"* ]]; then
+                echo "$ts $line"
+                echo "$line" >> "$log_file"
+                cc=$((cc+1)); echo "$cc $ec $wc" > "$counter_file"
+            elif [[ "$line" =~ ^Total: ]]; then
+                last_ts=$(< "$last_total_file")
+                now_ts=$(date +%s)
+                if (( now_ts - last_ts >= 30 )); then
+                    echo "$ts $line"
+                    echo "$now_ts" > "$last_total_file"
+                fi
+            elif [[ "${line,,}" == *"error"* ]]; then
+                echo "$ts [ERROR] $line"
+                log_line "[ERROR] $line"
+                ec=$((ec+1)); echo "$cc $ec $wc" > "$counter_file"
+            elif [[ "${line,,}" == *"warning"* ]]; then
+                echo "$ts [WARN] $line"
+                log_line "[WARN] $line"
+                wc=$((wc+1)); echo "$cc $ec $wc" > "$counter_file"
+            fi
+        done
 fi
 
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-echo "==== GOG Sync Run End: $(date -d @$end_time) (Elapsed: ${elapsed} seconds) ====" | tee -a "$log_file"
+
+# Read counters (written by the pipeline subshell via temp files)
+read -r complete_count error_count warn_count < "$counter_file" 2>/dev/null \
+    || { complete_count=0; error_count=0; warn_count=0; }
+rm -f "$counter_file" "$last_total_file"
+
+end_time_ns=$(date +%s%N)
+end_time_fmt=$(date +"%m/%d/%Y %H:%M:%S")
+elapsed_ns=$((end_time_ns - start_time_ns))
+elapsed_sec=$((elapsed_ns / 1000000000))
+elapsed_ms=$(( (elapsed_ns / 1000000) % 1000 ))
+elapsed_hr=$((elapsed_sec / 3600))
+elapsed_min=$(( (elapsed_sec % 3600) / 60 ))
+elapsed_s=$((elapsed_sec % 60))
+elapsed_fmt=$(printf "%02d:%02d:%02d.%03d" $elapsed_hr $elapsed_min $elapsed_s $elapsed_ms)
+
+summary_line="==== Summary: ${complete_count} file(s) completed, ${error_count} error(s), ${warn_count} warning(s) ===="
+end_line="==== GOG Sync Run End: $end_time_fmt (Elapsed: $elapsed_fmt) ===="
+echo "$summary_line"; log_line "$summary_line"
+echo "$end_line";     log_line "$end_line"
