@@ -4,5 +4,5 @@ services:
     container_name: gogrepo
     working_dir: /downloads
     volumes:
-      - C:/gog-archive/downloads:/downloads  # Where your games will be saved
-      - C:/Users/scotb/.config/lgogdownloader:/root/.config/lgogdownloader  # Persist your lgogdownloader config
+      - /data/apps/gog-archive:/downloads  # Where your games will be saved
+      - ~/.config/lgogdownloader:/home/goguser/.config/lgogdownloader  # Persist your lgogdownloader config

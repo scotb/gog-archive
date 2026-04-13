@@ -13,7 +13,10 @@ RUN git clone https://github.com/Sude-/lgogdownloader.git /lgogdownloader && \
     make && \
     make install
 
+RUN useradd -m -u 1000 goguser
+
 WORKDIR /downloads
+USER 1000:1000
 
 # Default command: show help
 CMD ["lgogdownloader", "--help"]

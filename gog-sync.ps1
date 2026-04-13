@@ -79,6 +79,7 @@ $completeCount = 0
 $errorCount    = 0
 $warnCount     = 0
 $lastTotalTime = [DateTime]::MinValue
+$tuiBlock      = [System.Collections.Generic.List[string]]::new()
 
 if ($ListAll -or ($lgogArgs -contains '--list')) {
     # List mode: show everything on console and log
@@ -116,17 +117,26 @@ if ($ListAll -or ($lgogArgs -contains '--list')) {
             if ($line -match 'Getting product data|Getting game names|Getting game info') { return }
             if ($line.Trim().Length -eq 0) { return }
             $ts = "[$(Get-Date -Format 'HH:mm:ss')]"
-            # Console and log: only meaningful events
             if ($line -match 'Download complete:|Repairing file:') {
                 Write-Host "$ts $line"
                 Add-Content -Path $logFile -Value $line
                 $completeCount++
+            } elseif ($line -match '^#0[\s:]') {
+                # Start of a new TUI block — reset accumulator
+                $tuiBlock.Clear(); $tuiBlock.Add($line) | Out-Null
+            } elseif ($tuiBlock.Count -gt 0 -and $line -notmatch '^Total:') {
+                # Inside a TUI block — accumulate thread header/progress lines
+                $tuiBlock.Add($line) | Out-Null
             } elseif ($line -match '^Total:') {
                 $now = Get-Date
-                if (($now - $lastTotalTime).TotalSeconds -ge 30) {
-                    Write-Host "$ts $line"
+                if (($now - $lastTotalTime).TotalSeconds -ge 30 -and $tuiBlock.Count -gt 0) {
+                    Write-Host "$ts --- TUI Status Snapshot ---"
+                    $tuiBlock | ForEach-Object { Write-Host $_ }
+                    Write-Host $line
+                    Write-Host "------------------"
                     $lastTotalTime = $now
                 }
+                $tuiBlock.Clear()
             } elseif ($line -imatch '\berror\b') {
                 Write-Host "$ts [ERROR] $line"
                 Write-Log "[ERROR] $line"

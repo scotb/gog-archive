@@ -153,19 +153,28 @@ else
         | grep -v -E 'Getting product data|Getting game names|Getting game info|^\s*$' \
         | while IFS= read -r line; do
             ts="[$(date '+%H:%M:%S')]"
-            # Console and log: only meaningful events
             read -r cc ec wc < "$counter_file"
             if [[ "$line" == *"Download complete:"* ]] || [[ "$line" == *"Repairing file:"* ]]; then
                 echo "$ts $line"
                 echo "$line" >> "$log_file"
                 cc=$((cc+1)); echo "$cc $ec $wc" > "$counter_file"
+            elif [[ "$line" =~ ^#0([[:space:]]|:) ]]; then
+                # Start of a new TUI block — reset accumulator
+                tui_block=("$line")
+            elif [[ ${#tui_block[@]} -gt 0 ]] && ! [[ "$line" =~ ^Total: ]]; then
+                # Inside a TUI block — accumulate thread header/progress lines
+                tui_block+=("$line")
             elif [[ "$line" =~ ^Total: ]]; then
                 last_ts=$(< "$last_total_file")
                 now_ts=$(date +%s)
-                if (( now_ts - last_ts >= 30 )); then
-                    echo "$ts $line"
+                if (( now_ts - last_ts >= 30 )) && [[ ${#tui_block[@]} -gt 0 ]]; then
+                    echo "$ts --- TUI Status Snapshot ---"
+                    printf '%s\n' "${tui_block[@]}"
+                    echo "$line"
+                    echo "------------------"
                     echo "$now_ts" > "$last_total_file"
                 fi
+                tui_block=()
             elif [[ "${line,,}" == *"error"* ]]; then
                 echo "$ts [ERROR] $line"
                 log_line "[ERROR] $line"
